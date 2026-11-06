@@ -1,0 +1,6 @@
+[submodule "sources/gbarecomp"]
+	path = sources/gbarecomp
+	url = https://github.com/mstan/gbarecomp.git
+[submodule "sources/recomp-ui"]
+	path = sources/recomp-ui
+	url = https://github.com/RetroPortingToolKit/recomp-ui.git

@@ -1,0 +1,374 @@
+diff --git a/src/armv4t/runtime_arm.cpp b/src/armv4t/runtime_arm.cpp
+index 7545710..d0a5eda 100644
+--- a/src/armv4t/runtime_arm.cpp
++++ b/src/armv4t/runtime_arm.cpp
+@@ -1843,7 +1843,15 @@ extern "C" void runtime_irq(uint32_t return_address) {
+     g_cpu.R[2]  = saved_r2;
+     g_cpu.R[3]  = saved_r3;
+     g_cpu.R[12] = saved_r12;
++    const bool irq_completed = g_irq_iret_depth == my_depth;
+     g_irq_iret_depth = saved_iret;  // restore an enclosing IRQ's expectation
++    // The IRQ exception return has completed and all handler host frames
++    // have unwound. Discard handler-only call hints; none can remain live
++    // in the interrupted mainline. Preserve the original IRQ floor exactly.
++    if (irq_completed) {
++        g_call_return_depth = g_call_return_floor;
++        clamp_call_return_hostless();
++    }
+     g_call_return_floor = saved_floor;
+     --g_irq_nest_depth;
+ }
+diff --git a/src/runtime/host_window.cpp b/src/runtime/host_window.cpp
+index 418729d..5bfd1d6 100644
+--- a/src/runtime/host_window.cpp
++++ b/src/runtime/host_window.cpp
+@@ -23,6 +23,9 @@
+ #include "touch_input.h"
+ #if defined(GBARECOMP_RUNTIME_UI)
+ #include "recomp_runtime_ui.h"
++#if defined(SMA3_MENU_BUILD)
++#include "sma3_controls.h"
++#endif
+ #endif
+ 
+ #if defined(GBARECOMP_HAVE_SDL2)
+@@ -354,6 +357,13 @@ struct Backend {
+     bool          sharp_target_failed = false;
+     SDL_AudioDeviceID audio_dev = 0;
+     SDL_GameController* controller = nullptr;
++#if defined(SMA3_MENU_BUILD)
++    sma3::Capture binding_capture;
++    bool menu_chord_latched = false;
++    bool menu_release_guard = false;
++    bool menu_audio_paused = false;
++    bool audio_user_enabled = true;
++#endif
+     SDL_JoystickID      controller_id = -1;
+     bool                controller_gyro = false;
+     SDL_Sensor*         device_gyro = nullptr;
+@@ -1422,7 +1432,16 @@ void render_host_layers(Backend* b) {
+         ImGui::NewFrame();
+         ImGuiOverlay ov(b, ImGui::GetBackgroundDrawList(), now);
+         draw_host_chrome(b, ov, menu_open);
+-        if (menu_open) recomp_runtime_ui_render_imgui(b->runtime_ui);
++        if (menu_open) {
++#if defined(SMA3_MENU_BUILD)
++            const bool capturing=b->binding_capture.action>=0;
++            if(capturing)ImGui::BeginDisabled();
++#endif
++            recomp_runtime_ui_render_imgui(b->runtime_ui);
++#if defined(SMA3_MENU_BUILD)
++            if(capturing)ImGui::EndDisabled();
++#endif
++        }
+         ImGui::Render();
+         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), b->renderer);
+     } else
+@@ -2015,6 +2034,9 @@ void HostWindow::push_audio_block(const int16_t* samples, std::size_t count,
+     if (!open_ || !impl_ || !samples || count == 0) return;
+     auto* b = static_cast<Backend*>(impl_);
+     if (b->audio_dev == 0) return;
++#if defined(SMA3_MENU_BUILD)
++    if(b->menu_audio_paused || !b->audio_user_enabled)return;
++#endif
+ 
+     // Volume (launcher setting + VolumeUp/Down hotkeys): scale into scratch
+     // before the bridge. 100 = passthrough, byte-identical to before.
+@@ -2767,14 +2789,42 @@ bool HostWindow::linear_filter() const {
+ void HostWindow::set_audio_enabled(bool enabled) {
+     if (!open_ || !impl_) return;
+     auto* b = static_cast<Backend*>(impl_);
++#if defined(SMA3_MENU_BUILD)
++    b->audio_user_enabled=enabled;
++    if(b->audio_dev)SDL_PauseAudioDevice(b->audio_dev, enabled && !b->menu_audio_paused ? 0 : 1);
++#else
+     if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, enabled ? 0 : 1);
++#endif
+ }
+ 
+ bool HostWindow::audio_enabled() const {
+     if (!open_ || !impl_) return false;
+     auto* b = static_cast<const Backend*>(impl_);
++#if defined(SMA3_MENU_BUILD)
++    return b->audio_dev && b->audio_user_enabled;
++#else
+     return b->audio_dev && SDL_GetAudioDeviceStatus(b->audio_dev) == SDL_AUDIO_PLAYING;
++#endif
++}
++
++#if defined(SMA3_MENU_BUILD)
++void HostWindow::set_menu_paused(bool paused) {
++    if(!open_ || !impl_)return;
++    auto* b=static_cast<Backend*>(impl_);
++    if(b->menu_audio_paused==paused)return;
++    b->menu_audio_paused=paused;
++    if(!b->audio_dev)return;
++    SDL_PauseAudioDevice(b->audio_dev,1);
++    if(b->audio_direct){SDL_ClearQueuedAudio(b->audio_dev);b->audio_direct_started=false;}
++    else if(b->bridge_ready){
++        SDL_LockMutex(b->audio_mtx);
++        const auto cfg=b->bridge.cfg;rab_free(&b->bridge);
++        b->bridge_ready=rab_init(&b->bridge,&cfg)==0;
++        SDL_UnlockMutex(b->audio_mtx);
++    }
++    if(!paused && b->audio_user_enabled && !b->audio_direct)SDL_PauseAudioDevice(b->audio_dev,0);
+ }
++#endif
+ 
+ void HostWindow::set_resize_driven_view(bool enabled) {
+     if (!open_ || !impl_) return;
+@@ -3052,6 +3102,46 @@ HostWindow::Events HostWindow::pump() {
+             ImGui::SetCurrentContext(b->runtime_imgui_context);
+             ImGui_ImplSDL2_ProcessEvent(&e);
+         }
++#if defined(SMA3_MENU_BUILD)
++        if (b->binding_capture.action >= 0 && e.type == SDL_CONTROLLERDEVICEREMOVED) {
++            b->binding_capture.cancel();b->menu_release_guard=true;
++            recomp_runtime_ui_set_status(b->runtime_ui,"Mando desconectado: captura cancelada");
++        }
++        if (b->binding_capture.action >= 0 &&
++            (e.type==SDL_KEYDOWN || e.type==SDL_KEYUP ||
++             e.type==SDL_CONTROLLERBUTTONDOWN || e.type==SDL_CONTROLLERBUTTONUP ||
++             e.type==SDL_CONTROLLERAXISMOTION)) {
++            const bool cancel = (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) ||
++                (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE);
++            if(cancel){b->binding_capture.cancel();b->menu_release_guard=true;recomp_runtime_ui_set_status(b->runtime_ui,"Captura cancelada");continue;}
++            int button=-1;
++            if(e.type==SDL_CONTROLLERBUTTONDOWN)button=e.cbutton.button;
++            if(e.type==SDL_CONTROLLERAXISMOTION && e.caxis.value>20000 && e.caxis.axis>=SDL_CONTROLLER_AXIS_TRIGGERLEFT)
++                button=15+e.caxis.axis-SDL_CONTROLLER_AXIS_TRIGGERLEFT;
++            if(button>=0 && b->binding_capture.accept(button,sma3::controls())){
++                bool ok=sma3::save_controls();
++                for(int i=0;i<sma3::Count;++i)sma3::control_label(i);
++                std::fprintf(stderr,"controller binding captured button=%d (%s) saved=%d\n",button,sma3::button_name(button),ok);
++                recomp_runtime_ui_set_status(b->runtime_ui,ok?"Asignacion guardada (duplicados intercambiados)":"No se pudo guardar la asignacion");
++                b->menu_release_guard=true;
++            }
++            // Capture owns all input, including key/button releases.
++            continue;
++        }
++        if (b->runtime_ui && e.type == SDL_CONTROLLERBUTTONDOWN &&
++            (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK || e.cbutton.button == SDL_CONTROLLER_BUTTON_START)) {
++            auto* pad = SDL_GameControllerFromInstanceID(e.cbutton.which);
++            if (pad && !b->menu_chord_latched &&
++                SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_BACK) &&
++                SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_START)) {
++                b->menu_chord_latched=true; b->menu_release_guard=true;
++                if (recomp_runtime_ui_is_open(b->runtime_ui)) recomp_runtime_ui_close(b->runtime_ui);
++                else recomp_runtime_ui_open(b->runtime_ui);
++                continue;
++            }
++        }
++        if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui)) b->menu_release_guard=true;
++#endif
+         if (runtime_ui_event(b->runtime_ui, e)) continue;
+ #endif
+         if (e.type == SDL_QUIT) {
+@@ -3252,6 +3342,22 @@ HostWindow::Events HostWindow::pump() {
+ #endif
+     }
+ 
++#if defined(SMA3_MENU_BUILD)
++    if (b->runtime_ui) {
++        const int requested=sma3::take_capture_request();
++        if(requested>=0){b->binding_capture.begin(requested);b->menu_release_guard=true;recomp_runtime_ui_set_status(b->runtime_ui,"Suelta los botones; luego pulsa el nuevo boton. Esc/Guide cancela.");}
++        if(b->binding_capture.action>=0){
++            bool released=true;
++            if(b->controller){
++                for(int i=0;i<SDL_CONTROLLER_BUTTON_MAX;++i)if(SDL_GameControllerGetButton(b->controller,(SDL_GameControllerButton)i))released=false;
++                for(int a=SDL_CONTROLLER_AXIS_TRIGGERLEFT;a<=SDL_CONTROLLER_AXIS_TRIGGERRIGHT;++a)
++                    if(SDL_GameControllerGetAxis(b->controller,(SDL_GameControllerAxis)a)>8000)released=false;
++            }
++            if(released)b->binding_capture.released();
++        }
++    }
++#endif
++
+     // Build the GBA KEYINPUT value from current keyboard state via the
+     // rebindable table (keybinds.ini; defaults in kDefaultBinds).
+     const Uint8* ks = SDL_GetKeyboardState(nullptr);
+@@ -3281,15 +3387,34 @@ HostWindow::Events HostWindow::pump() {
+             {8, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+             {9, SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+         };
++#if defined(SMA3_MENU_BUILD)
++        uint32_t pressed=0;
++        for(int i=0;i<=SDL_CONTROLLER_BUTTON_DPAD_RIGHT;++i)
++            if(SDL_GameControllerGetButton(b->controller,(SDL_GameControllerButton)i))pressed|=1u<<i;
++        for(int a=SDL_CONTROLLER_AXIS_TRIGGERLEFT;a<=SDL_CONTROLLER_AXIS_TRIGGERRIGHT;++a)
++            if(SDL_GameControllerGetAxis(b->controller,(SDL_GameControllerAxis)a)>16000)
++                pressed|=1u<<(15+a-SDL_CONTROLLER_AXIS_TRIGGERLEFT);
++        keys &= sma3::controls().keyinput(pressed);
++#else
+         for (const auto& binding : pad_map) {
+             if (SDL_GameControllerGetButton(b->controller, binding.button))
+                 keys &= static_cast<uint16_t>(~(1u << binding.bit));
+         }
++#endif
+     }
+     if (b->touch_controls) {
+         const uint16_t touch_buttons = active_touch_buttons(b);
+         keys &= static_cast<uint16_t>(~touch_buttons);
+     }
++#if defined(SMA3_MENU_BUILD)
++    if (b->menu_chord_latched && (!b->controller ||
++        (!SDL_GameControllerGetButton(b->controller,SDL_CONTROLLER_BUTTON_BACK) &&
++         !SDL_GameControllerGetButton(b->controller,SDL_CONTROLLER_BUTTON_START)))) b->menu_chord_latched=false;
++    if (b->menu_release_guard) {
++        if(keys==0x03FFu && !runtime_menu_open(b)) b->menu_release_guard=false;
++        keys=0x03FFu;
++    }
++#endif
+     ev.keyinput = keys;
+ #if defined(GBARECOMP_RUNTIME_UI)
+     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
+diff --git a/src/runtime/host_window.h b/src/runtime/host_window.h
+index 073ef16..5a4e4ff 100644
+--- a/src/runtime/host_window.h
++++ b/src/runtime/host_window.h
+@@ -105,6 +105,9 @@ public:
+     void save_audio_enhanced(bool enabled);
+     void set_audio_enabled(bool enabled);
+     bool audio_enabled() const;
++#if defined(SMA3_MENU_BUILD)
++    void set_menu_paused(bool paused);
++#endif
+     void set_resize_driven_view(bool enabled);
+ #if defined(GBARECOMP_RUNTIME_UI)
+     // Attach the capability-only shared model. HostWindow presents it through
+diff --git a/src/runtime/runtime.cpp b/src/runtime/runtime.cpp
+index 6466862..b708a8f 100644
+--- a/src/runtime/runtime.cpp
++++ b/src/runtime/runtime.cpp
+@@ -358,6 +358,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
+ #endif
+     else if (c->opts && c->opts->ui_set) return c->opts->ui_set(item->key, value);
+     else return 0;
++#if defined(SMA3_MENU_BUILD)
++    // The game owns persistence; shared standard controls still own applying.
++    if (c->opts && c->opts->ui_set) c->opts->ui_set(item->key, value);
++#endif
+     return 1;
+ }
+ 
+@@ -3270,6 +3274,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+         RecompRuntimeUiStandardConfig runtime_ui_config{};
+         runtime_ui_config.menu.title = runtime_title;
+         runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
++#if defined(SMA3_MENU_BUILD)
++        runtime_ui_config.menu.subtitle = "240 x 160 - 3:2 | Esc / Back + Start";
++        runtime_ui_config.window_scale_max = 6;
++#endif
+         runtime_ui_config.menu.theme = "gba";
+ #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
+         if (opts.ui_touch_friendly) {
+@@ -3465,6 +3473,22 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+         runtime_ui_context.ui =
+             recomp_runtime_ui_create_standard(&runtime_ui_config);
+         win.set_runtime_ui(runtime_ui_context.ui);
++#if defined(SMA3_MENU_BUILD)
++        if (opts.ui_get) {
++            const char* keys[] = {RECOMP_RUNTIME_UI_KEY_FULLSCREEN,
++                RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER,
++                RECOMP_RUNTIME_UI_KEY_AUDIO, RECOMP_RUNTIME_UI_KEY_VOLUME, GBARECOMP_UI_KEY_FPS};
++            for (const char* key : keys) {
++                int value = 0;
++                if (!opts.ui_get(key, &value)) continue;
++                if (!std::strcmp(key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE)) value=std::clamp(value,1,6);
++                if (!std::strcmp(key, RECOMP_RUNTIME_UI_KEY_FULLSCREEN)) value=std::clamp(value,0,2);
++                if (!std::strcmp(key, RECOMP_RUNTIME_UI_KEY_VOLUME)) value=std::clamp(value,0,100);
++                RecompRuntimeUiItem item{}; item.key=key;
++                runtime_ui_set(&runtime_ui_context,&item,value);
++            }
++        }
++#endif
+ #endif
+         sync_resize_driven_view();
+         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
+@@ -4174,6 +4198,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+     auto service_host_pause = [&]() {
+         bool waited = false;
+         while (!host_quit && args.window && (host_paused
++#if defined(SMA3_MENU_BUILD) && defined(GBARECOMP_RUNTIME_UI)
++                || (runtime_ui_context.ui && recomp_runtime_ui_is_open(runtime_ui_context.ui))
++#endif
+ #if defined(GBARECOMP_WEB_HOST)
+                 || win.auto_paused()
+ #endif
+@@ -4187,6 +4214,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+                 // as long as it stays hidden. Web only: native pause is unchanged.
+                 flush_save_notify();
+             }
++#endif
++#if defined(SMA3_MENU_BUILD)
++            if (!waited) {
++                std::fprintf(stderr,"menu/pause entered frame=%llu\n",(unsigned long long)ppu.frame_count());
++                bus.audio().discard_playback(); win.set_menu_paused(true);
++            }
+ #endif
+             waited = true;
+             pump_host_input();
+@@ -4202,6 +4235,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
+ #endif
+         }
+         if (waited && pacer) pacer->reset();
++#if defined(SMA3_MENU_BUILD)
++        if (waited) {
++            bus.audio().discard_playback(); win.set_menu_paused(false);
++            std::fprintf(stderr,"menu/pause resumed frame=%llu\n",(unsigned long long)ppu.frame_count());
++        }
++#endif
+ #if defined(GBARECOMP_WEB_HOST)
+         win.report_paused(false);
+         if (waited) { bus.audio().discard_playback(); win.reset_audio(); }
+diff --git a/tests/armv4t/tail_dispatch_test.cpp b/tests/armv4t/tail_dispatch_test.cpp
+index 4d6835b..e64a61c 100644
+--- a/tests/armv4t/tail_dispatch_test.cpp
++++ b/tests/armv4t/tail_dispatch_test.cpp
+@@ -128,6 +128,38 @@ void test_swi_return_ledger() {
+           "empty ledger leaves an SVC return alone");
+     runtime_fp_reset();
+ }
++// Model a handler that exception-returns past pending generated BL hints.
++// The instruction hook replaces only this unit fixture, never game execution.
++int irq_fixture_level = 0;
++int irq_fixture(uint32_t pc, int) {
++    if (pc != 0x18u) return 0;
++    ++irq_fixture_level;
++    const uint32_t interrupted = g_cpu.R[14] - 4u;
++    runtime_call_push_return(0x08004000u);
++    if (irq_fixture_level == 1) {
++        const auto depth = runtime_call_stack_depth();
++        runtime_irq(0x08005000u);
++        check(runtime_call_stack_depth() == depth,
++              "nested IRQ removes only its own pending returns");
++    }
++    runtime_call_push_return(0x08004004u);
++    runtime_exception_return(interrupted);
++    --irq_fixture_level;
++    return 1;
++}
++void test_irq_return_hints() {
++    reset(false);
++    runtime_call_push_return(0x08006000u);
++    g_runtime_force_interp_hook = irq_fixture;
++    for (unsigned i=0; i<1100; ++i) {
++        runtime_irq(0x08007000u);
++        check(runtime_call_stack_depth() == 1u,
++              "completed IRQ does not leak return hints across frames");
++        check(runtime_call_stack_data()[0] == 0x08006000u,
++              "IRQ preserves interrupted mainline return");
++    }
++    g_runtime_force_interp_hook = nullptr;
++}
+ void test_swi_context_isolation() {
+     reset(true);
+     g_cpu.R[15] = 0x08001002u;
+@@ -150,6 +182,7 @@ void test_swi_context_isolation() {
+ }  // namespace
+ 
+ int main() {
++    test_irq_return_hints();
+     test_exchange_and_miss();
+     test_swi();
+     test_swi_return_ledger();

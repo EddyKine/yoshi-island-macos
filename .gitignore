@@ -1,0 +1,34 @@
+# Private game data and generated code
+roms/
+build/
+cache/
+tmp/
+recomp_cache/
+portable/
+portable-tests/
+backups/
+saves/
+logs/
+menu-profile/
+*.gba
+*.bin
+*.rom
+*.sav
+*.srm
+*.state
+*.zip
+*.app/
+*.dylib
+*.o
+*.a
+rom.cfg
+bios.cfg
+recomp_coverage_*
+recomp_master_misses_*
+# Private diagnostic captures and source snapshots
+diagnostics/
+VERSION-*.json
+# macOS and Python metadata
+._*
+.DS_Store
+__pycache__/
