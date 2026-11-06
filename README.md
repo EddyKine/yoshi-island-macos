@@ -2,7 +2,9 @@
 
 Integración experimental de **Super Mario Advance 3: Yoshi’s Island** para Mac arm64, basada en [GBARecomp](https://github.com/mstan/gbarecomp), con menú durante el juego, ajustes de pantalla/audio y reasignación del mando mediante [recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui).
 
-**Debes aportar tu propia ROM y BIOS compatibles.** Este repositorio contiene fuentes, parches y referencias a dependencias; no distribuye el juego, la BIOS, código generado a partir de ellos, partidas ni una app compilada.
+**Debes aportar tu propia ROM y BIOS compatibles.** Este repositorio contiene fuentes, parches y referencias a dependencias; no distribuye el juego, la BIOS, código generado a partir de ellos, partidas. La app compilada sin esos datos está disponible en
+[Releases: v0.1.0-beta](https://github.com/EddyKine/yoshi-island-macos/releases/tag/v0.1.0-beta).
+Consulta [instalación y pruebas del paquete](docs/MACOS_RELEASE.md).
 
 ## Estado
 
@@ -33,7 +35,7 @@ bash scripts/run-menu.sh
 
 La preparación obtiene dependencias fijadas y aplica el parche local de GBARecomp. Solo inicializa los submódulos externos necesarios para este objetivo de escritorio. La compilación genera el cartucho y la BIOS localmente, compila el host base y el host con menú, y ejecuta las pruebas del menú.
 
-Los binarios quedan en `build/host/sma3_probe` y `build/menu/sma3_menu`. No se genera un bundle público listo para descargar. Los lanzadores `.app` privados del desarrollo original no se publican porque dependen de rutas locales y algunos paquetes contienen ROM/BIOS.
+Los binarios quedan en `build/host/sma3_probe` y `build/menu/sma3_menu`. Para crear el bundle público después de compilar, usa `python3 scripts/package-release.py --output build/releases/mi-beta`. Los lanzadores `.app` privados del desarrollo original no se publican porque dependen de rutas locales y algunos paquetes contienen ROM/BIOS.
 
 ## Jugar y configurar
 
